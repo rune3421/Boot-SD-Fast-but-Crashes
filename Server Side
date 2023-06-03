@@ -1,0 +1,306 @@
+//This method works for posting to another ESP as client, and using the ESP client code to post to serial. 
+
+#include <WiFi.h> // Include WIFi Library for ESP32
+#include <WebServer.h> // Include WebSwever Library for ESP32
+#include <ArduinoJson.h> // Include ArduinoJson Library
+#include <WebSocketsServer.h>  // Include Websocket Library
+#include "protocentralAds1292r.h"
+#include "ecgRespirationAlgo.h"
+#include <SPI.h>
+#include "max86150.h"
+#include <FIR.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "SparkFun_SGP30_Arduino_Library.h" // Click here to get the library: http://librarymanager/All#SparkFun_SGP30
+#include <Wire.h>
+
+SGP30 mySensor; //create an object of the SGP30 class
+
+// Data wire is plugged into port 4 on the ESP32
+#define ONE_WIRE_BUS 4
+
+// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
+OneWire oneWire(ONE_WIRE_BUS);
+
+// Pass our oneWire reference to Dallas Temperature. 
+DallasTemperature sensors(&oneWire);
+
+const char* ssid = "DUNGEON76";  // Your SSID
+const char* password = "580planetelegant"; // Your Password
+
+//Thermometer storage variable
+int Vo;
+
+//pH storage variable
+int pH;
+
+//CO2 storage variable
+int C02;
+
+//storage variables for ECG and PPG calculations
+volatile uint8_t globalHeartRate;
+volatile uint8_t globalRespirationRate=0;
+
+const int ADS1292_DRDY_PIN = 26;
+const int ADS1292_CS_PIN = 13;
+const int ADS1292_START_PIN = 14;
+const int ADS1292_PWDN_PIN = 27;
+
+int16_t ecgWaveBuff, ecgFilterout;
+int16_t resWaveBuff, respFilterout;
+
+int timer = 0; 
+long timeElapsed=0;
+
+ads1292r ADS1292R;
+ecg_respiration_algorithm ECG_RESPIRATION_ALGORITHM;
+
+String jsonString; // Temporary storage for the JSON String
+String longString = ""; // Buffer for ECG and PPG sensors between Websocket updates
+
+WebServer server(80);  // create instance for web server on port "80"
+WebSocketsServer webSocket = WebSocketsServer(81);  //create instance for webSocket server on port"81"
+
+//create an instance of the MAX heart and O2sensor
+MAX86150 max86150Sensor;
+
+int16_t ecgsigned16;
+int16_t redunsigned16;
+uint16_t ppgunsigned16;
+
+FIR<long, 13> fir;
+
+long coef[13] = {
+  -364,
+  -103,
+  -42,
+  60,
+  173,
+  262,
+  295,
+  262,
+  173,
+  60,
+  -42,
+  -103,
+  -364};
+
+  
+
+
+// This function gets a call when a WebSocket event occurs
+void webSocketEvent(byte num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED: // enum that read status this is used for debugging.
+      Serial.print("WS Type ");
+      Serial.print(type);
+      Serial.println(": DISCONNECTED");
+      break;
+    case WStype_CONNECTED:  // Check if a WebSocket client is connected or not
+      Serial.print("WS Type ");
+      Serial.print(type);
+      Serial.println(": CONNECTED");
+      break;
+    case WStype_TEXT: // check responce from client
+      Serial.println(); // the payload variable stores teh status internally
+      Serial.println(payload[0]);           
+      break;
+    case WStype_BIN:
+      Serial.printf("[%u] get binary length: %u\n", num, length);
+      Serial.println(payload[0]);
+
+      // send message to client
+      // webSocket.sendBIN(num, payload, length);
+      break;
+    case WStype_ERROR:
+      Serial.printf("Socket Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT_TEXT_START:
+      Serial.printf("Text Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT_BIN_START:
+      Serial.printf("Bin Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT:
+      Serial.printf("Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT_FIN:
+      Serial.printf("FIN Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+  }
+}
+
+
+void update_client()
+{
+  //check if the ECG is running
+  ads1292OutputValues ecgRespirationValues;
+  boolean ret = ADS1292R.getAds1292EcgAndRespirationSamples(ADS1292_DRDY_PIN,ADS1292_CS_PIN,&ecgRespirationValues);
+
+
+  if (ret == true)
+  {
+    ecgWaveBuff = (int16_t)(ecgRespirationValues.sDaqVals[1] >> 8) ;  // ignore the lower 8 bits out of 24bits
+    resWaveBuff = (int16_t)(ecgRespirationValues.sresultTempResp>>8) ;
+
+    //if(ecgRespirationValues.leadoffDetected == false)
+    //{
+      //ECG_RESPIRATION_ALGORITHM.ECG_ProcessCurrSample(&ecgWaveBuff, &ecgFilterout);   // filter out the line noise @40Hz cutoff 161 order
+      //ECG_RESPIRATION_ALGORITHM.QRS_Algorithm_Interface(ecgFilterout,&globalHeartRate);// calculate
+      
+      //disable below 2 lines if you want to run with arduino uno. (arduino uno does not have the memory to do all processing together)
+      //respFilterout = ECG_RESPIRATION_ALGORITHM.Resp_ProcessCurrSample(resWaveBuff);
+      //ECG_RESPIRATION_ALGORITHM.RESP_Algorithm_Interface(respFilterout,&globalRespirationRate);
+
+    //}else{
+
+      //ecgFilterout = 0;
+      //respFilterout = 0;
+    //}
+
+    if(millis() > timeElapsed)  // update every second
+    {
+      if(ecgRespirationValues.leadoffDetected == true) // lead in not connected
+      {
+        Serial.println("ECG lead error!!! ensure the leads are properly connected");
+      }else{
+          Vo = sensors.getTempCByIndex(0);//this happens at the beginning of every loop so that the sensor has time to respond to the request before the next pull
+          sensors.setWaitForConversion(false);  // makes it async
+          sensors.requestTemperatures();
+          sensors.setWaitForConversion(true);
+          //measure CO2
+          mySensor.measureAirQuality();
+          C02 = mySensor.CO2;
+          pH = analogRead(A6);
+
+
+      }
+      timeElapsed += 100;
+    }else{
+             //ecg MAX86150
+    if (max86150Sensor.check() > 0)
+  {
+    //timer print
+    timer = millis();
+
+    //ECG signal print
+    ecgsigned16 = (int16_t)(max86150Sensor.getECG() >> 2);
+
+    //PPG signal print
+    ppgunsigned16 = (uint16_t) (max86150Sensor.getFIFORed()>>2);
+  }
+
+            //create a JSON document for writing
+          StaticJsonDocument<100> doc;
+          // create an object
+          JsonObject object = doc.to<JsonObject>();
+          
+          object["timer"] = timer;
+          object["ECG"] = fir.processReading(ecgsigned16) ; //this is the tag of each kind of data to deserialize on the other end. Make sure to use this for multiple sensors later
+          object["PPG"] = ppgunsigned16 ; 
+          object["T"] = Vo ; 
+          object["CO2"] = C02;
+          object["pH"] = pH;
+          object["HR"] = globalHeartRate ; 
+          //object["RR"] = globalRespirationRate ; 
+          serializeJson(doc, jsonString); // serialize the object and save the result to teh string variable.
+          Serial.println(jsonString); // print the string for debugging.
+          webSocket.broadcastTXT(jsonString); // send the JSON object through the websocket
+          jsonString = ""; // clear the String.
+    }
+    }
+ 
+}
+
+
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(115200); // Init Serial for Debugging.
+ 
+  Wire.begin();
+  //Sensor supports I2C speeds up to 400kHz
+  Wire.setClock(400000);
+  //Initialize sensor
+  if (mySensor.begin() == false) {
+    Serial.println("No SGP30 Detected. Check connections.");
+    while (1);
+  }
+  //Initializes sensor for air quality readings
+  //measureAirQuality should be called in one second increments after a call to initAirQuality
+  mySensor.initAirQuality();
+  
+  WiFi.begin(ssid, password); // Connect to Wifi 
+  while (WiFi.status() != WL_CONNECTED) { // Check if wifi is connected or not
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  // Print the IP address in the serial monitor windows.
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  // Initialize a web server on the default IP address. and send the webpage as a response.
+  server.begin(); // init the server
+  webSocket.begin();  // init the Websocketserver
+  webSocket.onEvent(webSocketEvent);  // init the webSocketEvent function when a websocket event occurs 
+
+  SPI.begin();
+  SPI.setBitOrder(MSBFIRST);
+  //CPOL = 0, CPHA = 1
+  SPI.setDataMode(SPI_MODE1);
+  // Selecting 1Mhz clock for SPI
+  SPI.setClockDivider(SPI_CLOCK_DIV16);
+
+  //Pin settings for ECG and PPG
+  pinMode(ADS1292_DRDY_PIN, INPUT);
+  pinMode(ADS1292_CS_PIN, OUTPUT);
+  pinMode(ADS1292_START_PIN, OUTPUT);
+  pinMode(ADS1292_PWDN_PIN, OUTPUT);
+
+  ADS1292R.ads1292Init(ADS1292_CS_PIN,ADS1292_PWDN_PIN,ADS1292_START_PIN);  //initalize ADS1292 slave
+
+
+//ecg stream MAX86150
+  Serial.println("MAX86150 Basic Readings Example");
+
+  // Set the coefficients
+  fir.setFilterCoeffs(coef);
+
+  // Initialize sensor
+  if (max86150Sensor.begin(Wire, I2C_SPEED_FAST) == false)
+  {
+    Serial.println("MAX86150 was not found. Please check wiring/power. ");
+    while (1)
+      ;
+        }
+
+  max86150Sensor.setup(); // Configure sensor
+
+//PPG MAX 86150
+    Serial.println("MAX86150 PPG Streaming Example");
+
+    // Initialize sensor
+    if (max86150Sensor.begin(Wire, I2C_SPEED_FAST) == false)
+    {
+        Serial.println("MAX86150 was not found. Please check wiring/power. ");
+        while (1);
+    }
+
+    Serial.println(max86150Sensor.readPartID());
+
+    max86150Sensor.setup(); //Configure sensor. Use 6.4mA for LED drive
+    
+    sensors.begin(); // Start up the library for the digital thermometer
+}
+
+void loop() {
+  server.handleClient();  // webserver method that handles all Client
+  webSocket.loop(); // websocket server method that handles all Client
+  update_client(); //post data chunk
+  //delay(50); //throttle delay for client write to catch up
+}
