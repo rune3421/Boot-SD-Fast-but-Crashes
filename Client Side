@@ -1,0 +1,158 @@
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsClient.h>
+#include <SPI.h>
+#include <SD.h>
+
+// Wifi Credentials
+const char* ssid = "DUNGEON76"; // Wifi SSID
+const char* password = "580planetelegant"; //Wi-FI Password
+
+int PACKET_COUNT = 0;
+
+// Open file for writing
+const char* filename = "babyboot.txt";
+
+StaticJsonDocument<100> packet;
+DynamicJsonDocument doc(1024); // create a new JSON document
+JsonArray array = doc.to<JsonArray>();
+
+File myFile; //creates a file for the SD card to write to
+
+WebSocketsClient webSocket; // websocket client class instance
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch (type)  {
+    case WStype_TEXT: // log response from client
+    {
+      // Parse the JSON message
+      DeserializationError error = deserializeJson(doc, payload, length); // deserialize incoming JSON string
+      if (error) { // Print error message if incoming string is not JSON formatted
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.c_str());
+        return;
+      }
+ 
+      // Append the JSON object to the array
+      array.add(doc);
+
+      PACKET_COUNT++;
+
+      if (PACKET_COUNT == 8) {
+        // Write buffer to the SD card if the buffer is full
+        myFile = SD.open("/babyboot.txt", FILE_APPEND);
+        if (myFile) {
+          for (JsonVariant obj : array) { // iterate over each object in the array
+            serializeJson(obj, myFile); // serialize the object and write it to the file
+            myFile.println(); // add a newline character after each object
+          }
+          serializeJson(array, Serial); // serialize the array and print it to the Serial monitor
+          Serial.println();
+        }
+        else {
+          Serial.print("error opening SD File");
+        }
+        myFile.close();
+
+        // Reset Row to overwrite
+        PACKET_COUNT = 0;
+        // Clear array
+        array.clear();
+      }
+    }
+    break;
+    case WStype_DISCONNECTED:
+      Serial.printf("[WSc] Disconnected!\n");
+      break;
+    case WStype_CONNECTED:
+      Serial.printf("[WSc] Connected to url: %s\n", payload);
+
+      // send message to server when Connected
+      webSocket.sendTXT("Connected");
+      break;
+    case WStype_BIN:
+      Serial.printf("[%u] get binary length: %u\n", length);
+      Serial.println(payload[0]);
+
+      // send message to client
+      // webSocket.sendBIN(num, payload, length);
+      break;
+    case WStype_ERROR:
+      Serial.printf("Socket Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT_TEXT_START:
+      Serial.printf("Text Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT_BIN_START:
+      Serial.printf("Bin Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT:
+      Serial.printf("Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+    case WStype_FRAGMENT_FIN:
+      Serial.printf("FIN Fragment Error");
+      Serial.println(payload[0]); 
+      break;
+  }
+
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  //Start SD Card
+  Serial.print("Initializing SD card...");
+ 
+  if (!SD.begin(5)) {
+    Serial.println("initialization failed!");
+    return;
+  }
+  Serial.println("initialization done.");
+  
+  // Connect to local WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP()); // Print local IP address
+
+Serial.println(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+  //address, port, and URL path 
+  webSocket.begin("192.168.1.13", 81, "/"); 
+  // webSocket event handler
+Serial.println(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+  webSocket.onEvent(webSocketEvent);
+  // if connection failed retry every 5s
+  webSocket.setReconnectInterval(5000);
+
+      myFile = SD.open("/babyboot.txt", FILE_WRITE);
+      Serial.println(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+  // if the file opened okay, write to it:
+  if (myFile) {
+    Serial.printf("Writing chart headers to %s ", "/babyboot.txt");
+    myFile.println("TIME,ECG,PPG,TEMP,CO2,pH,HEART RATE");
+    myFile.close(); // close the file:
+    Serial.println("completed.");
+  }   // if the file didn't open, print an error:
+  else {
+    Serial.println("error opening file ");
+    Serial.println("/babyboot.txt");
+  }
+Serial.println(heap_caps_get_free_size(MALLOC_CAP_8BIT)); //debug code, to see how the processor is doing on serial
+  
+}
+
+
+void loop() {
+  Serial.println(heap_caps_get_free_size(MALLOC_CAP_8BIT)); //debug code, to see how the processor is doing on serial
+  webSocket.loop(); // Keep the socket alive
+  Serial.println(heap_caps_get_free_size(MALLOC_CAP_8BIT)); //debug code, to see how the processor is doing on serial
+}
